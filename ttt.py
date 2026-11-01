@@ -1,5 +1,10 @@
+from ultralytics import YOLO
 import cv2
-import numpy as np
+import time
+
+
+model = YOLO("src/models/YOLO/yolo11n.pt")
+model.to("cuda")
 
 pipeline = (
     "v4l2src device=/dev/video0 ! "
@@ -8,48 +13,43 @@ pipeline = (
     "queue leaky=downstream max-size-buffers=1 "
     "max-size-bytes=0 max-size-time=0 ! "
     "appsink drop=true max-buffers=1 sync=false"
-)
+) 
 
 cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
 
-green_lower = np.array([30, 60, 90], dtype=np.int8)
-green_upper = np.array([230, 115, 180], dtype=np.int8)
-
-kernel = np.ones((5,5), dtype=np.unit8)
+displayed_fps = 0.0
 
 while True:
+    start_time = time.perf_counter()
+
     ret, frame = cap.read()
 
     if not ret:
         break
-
-    lab_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
-
-    mask = cv2.inRange(lab_frame, green_lower, green_upper)
-
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-
-    contours, _=cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    if contours:
-        largest_contour = max(contours, key=cv2.contourArea)
-
-        if cv2.contourArea(largest_contour) > 500:
-            (center_x, center_y), radius = cv2.minEnclosingCircle(largest_contour)
-
-            center = (int(center_x),int(center_y)) 
-
-            cv2.circle(frame, center, int(radius), (0, 255, 0), 2)
-            cv2.circle(frame, center, 5 , (0, 0, 255), -1)
-
-    cv2.imshow("Object Detection", frame)
-    cv2.imshow("Biary Mask", mask)
-
     if cv2.waitKey(1) & 0xFF == ord("q"):
         break
 
+    results = model.predict(
+        source=frame,   # source image
+        conf=0.25,      # Confidence Threshold
+        iou=0.5,        # IoU Threshold
+        verbose=False,  # no output prints
+        classes=None,   # selected class
+    )
+
+    output_frame = results[0].plot()
+
+    elapsed_time = time.perf_counter() - start_time
+    current_fps = 1.0 / elapsed_time
+
+    if displayed_fps == 0:
+        displayed_fps = current_fps
+    else:
+        displayed_fps = 0.9 * displayed_fps + 0.1 * current_fps
+
+    cv2.putText(output_frame, f"FPS: {displayed_fps:.1f}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+
+    cv2.imshow("YOLO Object Detection with FPS", output_frame)
 
 cap.release()
 cv2.destroyAllWindows()
-
