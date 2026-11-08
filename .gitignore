@@ -1,0 +1,6 @@
+src/models/**
+.env
+src/audio
+cifar-10-python.tar.gz
+*.safetensors
+*.gguf
