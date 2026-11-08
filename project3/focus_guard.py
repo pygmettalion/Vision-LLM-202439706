@@ -14,9 +14,12 @@ Focus Guard : Vision-LLM 융합 시청각 멀티모달 공부 감독 시스템
  r : 지금까지 공부 리포트 음성으로 듣기
  e : (발표용) 강제로 경고 이벤트 발생
 
-* Jetson / 노트북 둘 다 동작하도록, 없는 구성요소는 자동으로 대체(fallback)합니다.
-  - TensorRT 엔진 없으면 yolo11n.pt
-  - Gemma mmproj 없으면 텍스트 전용, Gemma 자체가 없으면 규칙 기반 문장
+[실행] 아무 폴더에서나:  python3 focus_guard.py
+  - 모델이 있는 수업 폴더(~/vision-llm 등)를 자동으로 찾아서 그 폴더 기준으로 실행
+  - llama_cpp가 없는 파이썬으로 실행하면 수업 가상환경(.venv)으로 자동 재실행
+  - 카메라(USB/CSI), 마이크(arecord -l)를 자동 감지
+  - Gemma(필수): 모델 파일이 없으면 Hugging Face에서 자동 다운로드, 못 불러오면 종료
+  - 포즈 모델 없으면 자동 다운로드, TensorRT 엔진 없으면 yolo11n.pt
   - whisper.cpp 없으면 키보드 입력, Piper 없으면 콘솔 출력
 """
 
@@ -33,20 +36,35 @@ import platform
 import threading
 import subprocess
 
-import cv2
-import numpy as np
-from ultralytics import YOLO
-
 # ============================================================
 # 1. 설정
 # ============================================================
 IS_LINUX = platform.system() == "Linux"
 IS_WINDOWS = platform.system() == "Windows"
 
-# ---- 카메라 ----
-USE_JETSON_CSI = False      # Jetson CSI 카메라면 True, 노트북 웹캠/USB캠이면 False
+# ---- 카메라 (기본: 자동 감지) ----
+CAMERA_MODE = "auto"        # "auto" | "usb" | "csi" | "index"
 CAM_INDEX = 0
-FLIP_CODE = None            # 수업 코드처럼 상하반전 필요하면 0, 좌우반전(거울)은 1, 없으면 None
+FLIP_CODE = None            # 상하반전 필요하면 0, 좌우반전(거울)은 1, 없으면 None
+USB_DEVICE = "/dev/video0"
+CAM_WIDTH, CAM_HEIGHT = 1280, 720   # 화면이 확대돼 보이면 16:9 해상도를 사용 (안 되면 자동으로 640x480)
+
+USB_MJPG_PIPELINE = (
+    f"v4l2src device={USB_DEVICE} ! "
+    f"image/jpeg,width={CAM_WIDTH},height={CAM_HEIGHT},framerate=30/1 ! "
+    "jpegdec ! videoconvert ! video/x-raw,format=BGR ! "
+    "appsink drop=true max-buffers=1 sync=false"
+)
+
+# Jetson USB 카메라 (수업 tt.py와 동일한 GStreamer 파이프라인)
+USB_PIPELINE = (
+    f"v4l2src device={USB_DEVICE} ! "
+    "video/x-raw,format=YUY2,width=640,height=480,framerate=30/1 ! "
+    "videoconvert ! video/x-raw,format=BGR ! "
+    "queue leaky=downstream max-size-buffers=1 "
+    "max-size-bytes=0 max-size-time=0 ! "
+    "appsink drop=true max-buffers=1 sync=false"
+)
 
 CSI_PIPELINE = (
     "nvarguscamerasrc sensor-id=0 ! "
@@ -59,10 +77,16 @@ CSI_PIPELINE = (
     "appsink drop=true max-buffers=1 sync=false"
 )
 
-# ---- 모델 경로 (수업 폴더 구조 기준) ----
-YOLO_ENGINE_PATH = "src/models/YOLO/yolo11n_int8.engine"
-YOLO_PT_PATH = "src/models/YOLO/yolo11n.pt"
+# ---- 모델 경로 (수업 폴더 구조 기준, 아래 find_base_dir()가 수업 폴더를 자동으로 찾음) ----
+YOLO_CANDIDATES = [
+    "src/models/YOLO/yolo11n_int8.engine",
+    "src/models/YOLO/yolo11n_fp16.engine",
+    "src/models/YOLO/yolo11n_fp32.engine",
+    "src/models/YOLO/yolo11n.pt",
+]
 POSE_MODEL_PATH = "src/models/MediaPipe/pose_landmarker_full.task"
+POSE_MODEL_URL = ("https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
+                  "pose_landmarker_full/float16/latest/pose_landmarker_full.task")
 GEMMA_MODEL_PATH = "src/models/Gemma4/google_gemma-4-E2B-it-Q4_K_M.gguf"
 MMPROJ_PATH = "src/models/Gemma4/mmproj-google_gemma-4-E2B-it-f16.gguf"
 
@@ -70,7 +94,7 @@ CONTEXT_WINDOW = 2048
 MAX_TOKENS = 120
 
 # ---- STT (whisper.cpp) ----
-MIC_DEVICE = "plughw:3,0"   # arecord -l 로 확인한 번호로 수정
+MIC_DEVICE = "auto"         # "auto"면 arecord -l 결과에서 USB 마이크를 자동 선택 (직접 지정: "plughw:3,0")
 RECORD_SECONDS = 5
 AUDIO_FILE = "src/audio/input.wav"
 WHISPER_PATH = "whisper.cpp/build-cpu/bin/whisper-cli"
@@ -80,6 +104,7 @@ WHISPER_MODEL = "whisper.cpp/models/ggml-base.bin"
 PIPER_PYTHON = ".piper_venv/Scripts/python.exe" if IS_WINDOWS else ".piper_venv/bin/python"
 PIPER_MODEL = "src/models/Piper/ko_KR-kss-medium.onnx"
 TTS_FILE = "src/audio/response.wav"
+SPEAKER_DEVICE = "auto"     # "auto"면 기본 장치 → USB 스피커 순서로 자동 시도 (직접 지정: "plughw:3,0")
 
 # ---- 출력 ----
 JSON_PATH = "src/json/focus_state.json"
@@ -128,6 +153,142 @@ STATE_COLOR = {
     STATE_ABSENT: (160, 160, 160),
 }
 
+
+# ============================================================
+# 1-1. 자동 환경 설정 (수업 폴더 / 마이크 / 포즈 모델)
+# ============================================================
+HOME = os.path.expanduser("~")
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _base_score(d):
+    """이 폴더에 수업 모델이 얼마나 있는지 점수화"""
+    checks = [
+        (GEMMA_MODEL_PATH, 4), (PIPER_MODEL, 2), (WHISPER_MODEL, 2),
+        (POSE_MODEL_PATH, 1), (YOLO_CANDIDATES[0], 1), (YOLO_CANDIDATES[-1], 1),
+    ]
+    return sum(w for p, w in checks if os.path.exists(os.path.join(d, p)))
+
+
+def find_base_dir():
+    """모델이 들어있는 수업 폴더(src/models가 있는 곳)를 찾음"""
+    candidates = [os.getcwd(), SCRIPT_DIR, os.path.dirname(SCRIPT_DIR),
+                  os.path.join(HOME, "vision-llm")]
+    # 홈 아래 3단계까지 src/models 폴더가 있는 곳도 후보로 추가
+    for root, dirs, _ in os.walk(HOME):
+        depth = root[len(HOME):].count(os.sep)
+        dirs[:] = [x for x in dirs if not x.startswith(".") and x not in ("node_modules", "snap")]
+        if depth >= 3:
+            dirs[:] = []
+        if os.path.isdir(os.path.join(root, "src", "models")):
+            candidates.append(root)
+
+    best, best_score = os.getcwd(), -1
+    for d in candidates:
+        if os.path.isdir(d):
+            score = _base_score(d)
+            if score > best_score:
+                best, best_score = d, score
+    return best
+
+
+def detect_mic():
+    """arecord -l 결과에서 USB 마이크(없으면 첫 번째 장치)를 plughw:N,M으로 반환"""
+    if not (IS_LINUX and shutil.which("arecord")):
+        return None
+    out = subprocess.run(["arecord", "-l"], capture_output=True, text=True).stdout
+    cards = re.findall(r"card (\d+): (\S+) \[([^\]]*)\], device (\d+):", out)
+    if not cards:
+        return None
+    pick = next((c for c in cards if "usb" in (c[1] + c[2]).lower()), cards[0])
+    return f"plughw:{pick[0]},{pick[3]}"
+
+
+def ensure_pose_model():
+    """포즈 모델이 없으면 자동 다운로드"""
+    if os.path.exists(POSE_MODEL_PATH):
+        return
+    try:
+        import urllib.request
+        os.makedirs(os.path.dirname(POSE_MODEL_PATH), exist_ok=True)
+        print("[Pose] 모델 다운로드 중...")
+        urllib.request.urlretrieve(POSE_MODEL_URL, POSE_MODEL_PATH)
+        print("[Pose] 다운로드 완료")
+    except Exception as e:
+        print("[Pose] 다운로드 실패 (인터넷 확인):", e)
+
+
+REQUIRED_MODULES = ["llama_cpp", "ultralytics", "cv2", "mediapipe"]
+
+
+def _python_has_modules(python):
+    code = "import " + ", ".join(REQUIRED_MODULES)
+    return subprocess.run([python, "-c", code], capture_output=True).returncode == 0
+
+
+def ensure_python_env():
+    """지금 파이썬에 llama_cpp 등이 없으면, 수업 가상환경(.venv)의 파이썬으로 자동 재실행"""
+    if os.environ.get("FOCUS_GUARD_REEXEC") == "1":
+        return
+    if _python_has_modules(sys.executable):
+        return
+
+    candidates = [
+        os.path.join(BASE_DIR, ".venv", "bin", "python"),
+        os.path.join(HOME, "vision-llm", ".venv", "bin", "python"),
+        os.path.join(os.path.dirname(SCRIPT_DIR), ".venv", "bin", "python"),
+    ]
+    for python in candidates:
+        if os.path.exists(python) and _python_has_modules(python):
+            print(f"[Env] 수업 가상환경으로 다시 실행: {python}")
+            os.environ["FOCUS_GUARD_REEXEC"] = "1"
+            script = os.path.join(SCRIPT_DIR, os.path.basename(__file__))
+            os.execv(python, [python, script] + sys.argv[1:])
+
+    sys.exit(
+        "[Env] llama_cpp / ultralytics / cv2 / mediapipe 가 모두 설치된 파이썬을 찾지 못했습니다.\n"
+        "      수업 가상환경을 켜고 실행하세요:  source ~/vision-llm/.venv/bin/activate"
+    )
+
+
+def ensure_gemma_files():
+    """Gemma GGUF / mmproj가 없으면 수업과 동일한 저장소에서 자동 다운로드"""
+    missing = [p for p in (GEMMA_MODEL_PATH, MMPROJ_PATH) if not os.path.exists(p)]
+    if not missing:
+        return
+    try:
+        from huggingface_hub import hf_hub_download
+        token = os.getenv("HF_TOKEN")
+        try:
+            from dotenv import load_dotenv
+            load_dotenv()
+            token = token or os.getenv("HF_TOKEN")
+        except ImportError:
+            pass
+        for path in missing:
+            print(f"[Gemma] {os.path.basename(path)} 다운로드 중... (용량이 커서 몇 분 걸림)")
+            hf_hub_download(
+                repo_id="bartowski/google_gemma-4-E2B-it-GGUF",
+                filename=os.path.basename(path),
+                token=token,
+                local_dir=os.path.dirname(path),
+            )
+        print("[Gemma] 다운로드 완료")
+    except Exception as e:
+        print("[Gemma] 다운로드 실패:", e)
+
+
+BASE_DIR = find_base_dir()
+os.chdir(BASE_DIR)          # 이후 모든 상대 경로(src/models/..., whisper.cpp/...)는 수업 폴더 기준
+ensure_python_env()
+
+import cv2                   # noqa: E402  (가상환경 확인 후 import)
+import numpy as np           # noqa: E402
+from ultralytics import YOLO # noqa: E402
+
+if MIC_DEVICE == "auto":
+    MIC_DEVICE = detect_mic() or "default"
+
 for d in ["src/audio", "src/json", "src/output"]:
     os.makedirs(d, exist_ok=True)
 
@@ -141,10 +302,34 @@ def _clean_for_speech(text):
     return text.strip()
 
 
+_speaker_device = None   # 한 번 소리가 난 스피커 장치를 기억
+
+
+def _playback_devices():
+    """aplay -l 결과에서 재생 장치 목록 (USB 우선)"""
+    out = subprocess.run(["aplay", "-l"], capture_output=True, text=True).stdout
+    cards = re.findall(r"card (\d+): (\S+) \[([^\]]*)\], device (\d+):", out)
+    cards.sort(key=lambda c: "usb" not in (c[1] + c[2]).lower())
+    return [f"plughw:{c[0]},{c[3]}" for c in cards]
+
+
 def play_wav(path):
+    global _speaker_device
     try:
         if IS_LINUX and shutil.which("aplay"):
-            subprocess.run(["aplay", "-q", path], check=True)
+            # 기본 장치 → 실패하면 USB 스피커 → 나머지 장치 순서로 시도
+            devices = [_speaker_device] if _speaker_device else (
+                [SPEAKER_DEVICE] if SPEAKER_DEVICE != "auto" else [None] + _playback_devices())
+            for dev in devices:
+                cmd = ["aplay", "-q", path] if dev is None else ["aplay", "-q", "-D", dev, path]
+                r = subprocess.run(cmd, capture_output=True, text=True)
+                if r.returncode == 0:
+                    if _speaker_device is None:
+                        _speaker_device = dev or "default"
+                        if dev:
+                            print(f"[TTS] 스피커: {dev}")
+                    return
+                print(f"[TTS] aplay 실패 ({dev or 'default'}): {r.stderr.strip()[:150]}")
         elif IS_WINDOWS:
             import winsound
             winsound.PlaySound(path, winsound.SND_FILENAME)
@@ -162,15 +347,16 @@ def text_to_speech(text):
 
     # 1순위: 수업에서 쓴 Piper
     if os.path.exists(PIPER_PYTHON) and os.path.exists(PIPER_MODEL):
-        try:
-            subprocess.run(
-                [PIPER_PYTHON, "-m", "piper", "-m", PIPER_MODEL, "-f", TTS_FILE, "--", text],
-                check=True, capture_output=True,
-            )
+        r = subprocess.run(
+            [PIPER_PYTHON, "-m", "piper", "-m", PIPER_MODEL, "-f", TTS_FILE, "--", text],
+            capture_output=True, text=True,
+        )
+        if r.returncode == 0 and os.path.exists(TTS_FILE):
             play_wav(TTS_FILE)
             return
-        except Exception as e:
-            print("[TTS] Piper 실패:", e)
+        print("[TTS] Piper 음성 생성 실패:", (r.stderr or r.stdout).strip()[-300:])
+    else:
+        print(f"[TTS] Piper 없음: {os.path.abspath(PIPER_PYTHON)} / {os.path.abspath(PIPER_MODEL)}")
 
     # 2순위: pyttsx3 (노트북 테스트용, 설치돼 있으면)
     try:
@@ -249,18 +435,18 @@ def speech_to_text(status_cb=None):
 # 3. Gemma (멀티모달 LLM)
 # ============================================================
 class GemmaBrain:
+    """Gemma는 필수: 모델을 못 불러오면 대체하지 않고 종료"""
+
     def __init__(self):
         self.llm = None
         self.vision = False
-        try:
-            from llama_cpp import Llama
-        except ImportError:
-            print("[Gemma] llama_cpp 없음 → 규칙 기반 문장으로 대체")
-            return
 
+        from llama_cpp import Llama
+
+        ensure_gemma_files()
         if not os.path.exists(GEMMA_MODEL_PATH):
-            print(f"[Gemma] 모델 없음({GEMMA_MODEL_PATH}) → 규칙 기반 문장으로 대체")
-            return
+            sys.exit(f"[Gemma] 모델 파일이 없습니다: {os.path.abspath(GEMMA_MODEL_PATH)}\n"
+                     "        인터넷 연결 후 다시 실행하면 자동으로 다운로드합니다.")
 
         chat_handler = None
         if os.path.exists(MMPROJ_PATH):
@@ -269,7 +455,9 @@ class GemmaBrain:
                 chat_handler = Gemma4ChatHandler(clip_model_path=MMPROJ_PATH)
                 self.vision = True
             except Exception as e:
-                print("[Gemma] 이미지 핸들러 로드 실패 → 텍스트 전용:", e)
+                print("[Gemma] ⚠ 이미지 핸들러 로드 실패 → 이미지 없이 텍스트만 전달:", e)
+        else:
+            print("[Gemma] ⚠ mmproj 파일이 없어 이미지 없이 텍스트만 전달합니다.")
 
         self.llm = Llama(
             model_path=GEMMA_MODEL_PATH,
@@ -286,9 +474,12 @@ class GemmaBrain:
         if self.llm is None:
             return None
 
+        print("[Gemma] 생각 중...", flush=True)
+        t0 = time.time()
+
         if self.vision and image_bgr is not None:
             h, w = image_bgr.shape[:2]
-            scale = 640 / max(h, w)
+            scale = 512 / max(h, w)   # 엣지 기기 속도를 위해 이미지 축소
             if scale < 1:
                 image_bgr = cv2.resize(image_bgr, (int(w * scale), int(h * scale)))
             ok, buf = cv2.imencode(".jpg", image_bgr)
@@ -309,7 +500,9 @@ class GemmaBrain:
                 max_tokens=max_tokens,
                 temperature=0.7,
             )
-            return response["choices"][0]["message"]["content"].strip()
+            answer = response["choices"][0]["message"]["content"].strip()
+            print(f"[Gemma] 응답 완료 ({time.time() - t0:.1f}초)")
+            return answer
         except Exception as e:
             print("[Gemma] 추론 실패:", e)
             return None
@@ -383,19 +576,21 @@ FALLBACK_SCOLD = {
 # 4. Vision: YOLO + MediaPipe Pose → 상태 판단
 # ============================================================
 def load_yolo():
-    if os.path.exists(YOLO_ENGINE_PATH):
-        print("[YOLO] TensorRT INT8 엔진 사용")
-        return YOLO(YOLO_ENGINE_PATH)
-    path = YOLO_PT_PATH if os.path.exists(YOLO_PT_PATH) else "yolo11n.pt"
-    print(f"[YOLO] {path} 사용")
-    return YOLO(path)
+    for path in YOLO_CANDIDATES:
+        if os.path.exists(path):
+            print(f"[YOLO] {path} 사용")
+            return YOLO(path)
+    # 수업 모델이 없으면 ultralytics가 yolo11n.pt를 자동 다운로드
+    os.makedirs("src/models/YOLO", exist_ok=True)
+    print("[YOLO] 수업 모델 없음 → yolo11n.pt 자동 다운로드")
+    model = YOLO("yolo11n.pt")
+    return model
 
 
 def load_pose():
+    ensure_pose_model()
     if not os.path.exists(POSE_MODEL_PATH):
-        print(f"[Pose] {POSE_MODEL_PATH} 없음 → 자세 판단 없이 YOLO만 사용")
-        print("  wget https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
-              "pose_landmarker_full/float16/latest/pose_landmarker_full.task -O " + POSE_MODEL_PATH)
+        print(f"[Pose] ⚠ {POSE_MODEL_PATH} 없음 → 자세 판단 없이 YOLO만 사용")
         return None, None
     import mediapipe as mp
     from mediapipe.tasks import python as mp_python
@@ -404,16 +599,54 @@ def load_pose():
     options = mp_vision.PoseLandmarkerOptions(
         base_options=mp_python.BaseOptions(model_asset_path=POSE_MODEL_PATH),
         num_poses=1,
+        min_pose_detection_confidence=0.3,
+        min_pose_presence_confidence=0.3,
+        min_tracking_confidence=0.3,
     )
-    return mp_vision.PoseLandmarker.create_from_options(options), mp
+    detector = mp_vision.PoseLandmarker.create_from_options(options)
+    print(f"[Pose] {POSE_MODEL_PATH} 로드 완료")
+    return detector, mp
 
 
 def open_camera():
-    if USE_JETSON_CSI:
-        return cv2.VideoCapture(CSI_PIPELINE, cv2.CAP_GSTREAMER)
-    if IS_WINDOWS:
-        return cv2.VideoCapture(CAM_INDEX, cv2.CAP_DSHOW)
-    return cv2.VideoCapture(CAM_INDEX)
+    """USB(GStreamer) → CSI → 일반 인덱스 순으로 열리는 카메라를 자동 선택"""
+    attempts = []
+    if IS_LINUX and CAMERA_MODE in ("auto", "usb") and os.path.exists(USB_DEVICE):
+        # 1순위: 16:9 1280x720 (MJPG). 640x480(4:3)은 센서를 잘라 써서 화면이 확대돼 보임
+        attempts.append((f"USB 카메라 {CAM_WIDTH}x{CAM_HEIGHT} (MJPG)", open_usb_wide))
+        attempts.append(("USB 카메라 (GStreamer MJPG)", lambda: cv2.VideoCapture(USB_MJPG_PIPELINE, cv2.CAP_GSTREAMER)))
+        attempts.append(("USB 카메라 640x480 (GStreamer)", lambda: cv2.VideoCapture(USB_PIPELINE, cv2.CAP_GSTREAMER)))
+    if IS_LINUX and CAMERA_MODE in ("auto", "csi") and shutil.which("gst-inspect-1.0"):
+        attempts.append(("CSI 카메라", lambda: cv2.VideoCapture(CSI_PIPELINE, cv2.CAP_GSTREAMER)))
+    if CAMERA_MODE in ("auto", "index"):
+        backend = cv2.CAP_DSHOW if IS_WINDOWS else cv2.CAP_ANY
+        attempts.append((f"카메라 {CAM_INDEX}번", lambda: cv2.VideoCapture(CAM_INDEX, backend)))
+
+    for name, opener in attempts:
+        try:
+            cap = opener()
+        except Exception:
+            continue
+        if cap is not None and cap.isOpened():
+            ok, frame = cap.read()
+            if ok and frame is not None:
+                print(f"[Camera] {name} 사용 → 실제 해상도 {frame.shape[1]}x{frame.shape[0]}")
+                return cap
+        if cap is not None:
+            cap.release()
+    return None
+
+
+def open_usb_wide():
+    """V4L2로 USB 카메라를 MJPG 1280x720으로 열기 (화각 넓게)"""
+    index = int(re.sub(r"\D", "", USB_DEVICE) or 0)
+    cap = cv2.VideoCapture(index, cv2.CAP_V4L2)
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAM_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_HEIGHT)
+    cap.set(cv2.CAP_PROP_FPS, 30)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    return cap
 
 
 def yolo_to_objects(result):
@@ -452,7 +685,9 @@ def analyze_pose(landmarks, w, h):
         return (p.x * w, p.y * h)
 
     def vis(i):
-        return getattr(landmarks[i], "visibility", 1.0) or 0.0
+        # mediapipe 버전에 따라 visibility가 None으로 오는 경우가 있어 그때는 보이는 것으로 처리
+        v = getattr(landmarks[i], "visibility", None)
+        return 1.0 if v is None else float(v)
 
     # 손: 손목(15,16) + 검지(19,20)
     for i in (15, 16, 19, 20):
@@ -488,7 +723,17 @@ def analyze_pose(landmarks, w, h):
     info["keypoints"] = {k: px(i) for k, i in
                          [("nose", 0), ("l_ear", 7), ("r_ear", 8), ("l_sh", 11),
                           ("r_sh", 12), ("l_wr", 15), ("r_wr", 16)] if vis(i) > 0.3}
+    # 화면에 스켈레톤을 그리기 위한 전체 33개 점
+    info["all_points"] = [(px(i), vis(i)) for i in range(len(landmarks))]
     return info
+
+
+# 상반신 위주 스켈레톤 연결선 (MediaPipe Pose index)
+POSE_CONNECTIONS = [
+    (0, 2), (2, 7), (0, 5), (5, 8), (9, 10),                 # 얼굴
+    (11, 12), (11, 13), (13, 15), (12, 14), (14, 16),        # 어깨·팔
+    (15, 19), (16, 20), (11, 23), (12, 24), (23, 24),        # 손·몸통
+]
 
 
 def decide_state(objects, pose_info):
@@ -673,9 +918,19 @@ class Assistant(threading.Thread):
 # ============================================================
 # 7. 화면 표시
 # ============================================================
-def draw_overlay(frame, objects, held, pose_info, state, duration, session, assistant):
+def draw_overlay(frame, objects, held, pose_info, state, duration, session, assistant, pose_status=""):
     h, w = frame.shape[:2]
     color = STATE_COLOR[state]
+
+    # 자세 추정 스켈레톤
+    if pose_info:
+        pts = pose_info["all_points"]
+        for a, b in POSE_CONNECTIONS:
+            if a < len(pts) and b < len(pts) and pts[a][1] > 0.4 and pts[b][1] > 0.4:
+                cv2.line(frame, tuple(map(int, pts[a][0])), tuple(map(int, pts[b][0])), (255, 255, 255), 2)
+        for (x, y), v in pts[:25]:
+            if v > 0.4:
+                cv2.circle(frame, (int(x), int(y)), 3, (0, 200, 255), -1)
 
     for o in objects:
         x1, y1, x2, y2 = o["bbox"]
@@ -722,6 +977,10 @@ def draw_overlay(frame, objects, held, pose_info, state, duration, session, assi
 
     cv2.putText(frame, "q:quit  v:voice  r:report  e:test", (12, h - 28),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
+
+    # 자세 추정 동작 상태 표시
+    pose_color = (80, 220, 80) if pose_status == "POSE: OK" else (0, 0, 255)
+    cv2.putText(frame, pose_status, (w - 220, h - 28), cv2.FONT_HERSHEY_SIMPLEX, 0.55, pose_color, 2)
     return frame
 
 
@@ -729,16 +988,27 @@ def draw_overlay(frame, objects, held, pose_info, state, duration, session, assi
 # 8. 메인 루프
 # ============================================================
 def main():
+    print(f"[Env] 수업 폴더: {BASE_DIR}")
+    print(f"[Env] 파이썬: {sys.executable}")
+    print(f"[Mic] {MIC_DEVICE}")
+    print(f"[STT] whisper.cpp: {'OK' if _whisper_exe() and os.path.exists(WHISPER_MODEL) else '⚠ 없음 → 키보드 입력'}")
+    print(f"[TTS] Piper: {'OK' if os.path.exists(PIPER_PYTHON) and os.path.exists(PIPER_MODEL) else '⚠ 없음 → 콘솔 출력'}")
+
+    brain = GemmaBrain()
+
+    # 시작할 때 음성 출력 테스트 (여기서 소리가 안 나면 스피커/Piper 문제)
+    print("[TTS] 음성 출력 테스트")
+    text_to_speech("포커스 가드를 시작합니다.")
+
     yolo = load_yolo()
     pose_detector, mp = load_pose()
-    brain = GemmaBrain()
     session = Session()
     assistant = Assistant(brain, session)
     assistant.start()
 
     cap = open_camera()
-    if not cap.isOpened():
-        print("카메라를 열 수 없습니다.")
+    if cap is None:
+        print("카메라를 열 수 없습니다. 카메라 연결을 확인하세요.")
         sys.exit(1)
 
     print("q: 종료 | v: 음성 질문 | r: 공부 리포트 | e: 테스트 경고")
@@ -746,6 +1016,7 @@ def main():
     state, state_since = STATE_FOCUS, time.time()
     last_alert = 0.0
     prev_t = time.time()
+    pose_error_printed = False
 
     while True:
         ret, frame = cap.read()
@@ -764,11 +1035,22 @@ def main():
 
         # --- 2) MediaPipe 자세 추정 ---
         pose_info = None
-        if pose_detector is not None:
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            pose_result = pose_detector.detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb))
-            if pose_result.pose_landmarks:
-                pose_info = analyze_pose(pose_result.pose_landmarks[0], w, h)
+        if pose_detector is None:
+            pose_status = "POSE: NO MODEL"
+        else:
+            try:
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                pose_result = pose_detector.detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb))
+                if pose_result.pose_landmarks:
+                    pose_info = analyze_pose(pose_result.pose_landmarks[0], w, h)
+                    pose_status = "POSE: OK"
+                else:
+                    pose_status = "POSE: NO PERSON"
+            except Exception as e:
+                pose_status = "POSE: ERROR"
+                if not pose_error_printed:
+                    print("[Pose] 추론 오류:", e)
+                    pose_error_printed = True
 
         # --- 3) 규칙 기반 상태 판단 ---
         new_state, held, nearby = decide_state(objects, pose_info)
@@ -782,7 +1064,8 @@ def main():
         triggered = (state != STATE_FOCUS and duration >= limit
                      and now - last_alert > COOLDOWN_SEC and not assistant.busy)
 
-        display = draw_overlay(frame.copy(), objects, held, pose_info, state, duration, session, assistant)
+        display = draw_overlay(frame.copy(), objects, held, pose_info, state, duration, session, assistant,
+                               pose_status)
         cv2.imshow("Focus Guard (YOLO + Pose + Gemma)", display)
         key = cv2.waitKey(1) & 0xFF
 

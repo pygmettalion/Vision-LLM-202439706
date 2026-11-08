@@ -43,50 +43,24 @@ Camera ─▶ YOLO11n INT8 (휴대폰 · 책 · 노트북)
 
 ## 실행 방법
 
-### Jetson
-
 ```bash
 cd ~/vision-llm
-git clone https://github.com/pygmettalion/focus-guard.git
-cp focus-guard/focus_guard.py .
-source .venv/bin/activate
-python3 focus_guard.py
+python3 project3/focus_guard.py
 ```
 
-`focus_guard.py` 상단 설정 수정:
+실행하면 자동으로 설정됩니다.
 
-```python
-USE_JETSON_CSI = True
-FLIP_CODE = 0
-MIC_DEVICE = "plughw:?,0"   # arecord -l 결과에 맞게
-```
-
-업데이트:
-
-```bash
-cd ~/vision-llm/focus-guard
-git pull
-cp focus_guard.py ..
-```
-
-### 노트북 (테스트용)
-
-```bash
-pip install ultralytics mediapipe opencv-python
-mkdir -p src/models/MediaPipe
-curl -L -o src/models/MediaPipe/pose_landmarker_full.task https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/latest/pose_landmarker_full.task
-python focus_guard.py
-```
-
-Gemma, Whisper, Piper가 없으면 자동으로 대체됩니다.
-
-| 구성요소 | 없을 때 |
+| 항목 | 동작 |
 |---|---|
-| TensorRT 엔진 | `yolo11n.pt` 사용 |
-| Gemma mmproj | 텍스트 전용 입력 |
-| Gemma | 규칙 기반 문장 |
-| Whisper | 터미널 키보드 입력 |
-| Piper | 콘솔 출력 |
+| 수업 폴더 | 모델이 있는 폴더(`~/vision-llm` 등)를 찾아 그 폴더 기준으로 실행 |
+| 가상환경 | `llama_cpp`가 없는 파이썬이면 수업 `.venv`로 자동 재실행 |
+| 카메라 | USB(1280x720 → 640x480) → CSI → 0번 순서로 자동 선택 |
+| 마이크 / 스피커 | `arecord -l` / `aplay -l`에서 USB 장치 자동 선택 |
+| Gemma (필수) | 없으면 `bartowski/google_gemma-4-E2B-it-GGUF`에서 자동 다운로드, 로드 실패 시 종료 |
+| 포즈 모델 | 없으면 자동 다운로드 |
+| whisper.cpp / Piper | 없으면 키보드 입력 / 콘솔 출력 |
+
+시작할 때 "포커스 가드를 시작합니다" 음성으로 스피커를 테스트합니다.
 
 ## 조작 키
 
