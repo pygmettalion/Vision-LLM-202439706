@@ -1,0 +1,1 @@
+cd ~/vision-llm && source .venv/bin/activate && python3 project3/focus_guard.py
